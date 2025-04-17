@@ -9,6 +9,8 @@ import subprocess as sp
 from PIL import Image
 from torchvision import transforms
 from decord import VideoReader, cpu
+import torchaudio
+from torch.nn import functional as F
 
 class PadCrop(nn.Module):
     def __init__(self, n_samples, randomize=True):
