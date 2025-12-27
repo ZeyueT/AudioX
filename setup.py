@@ -8,6 +8,8 @@ setup(
     description='Training and inference tools for generative audio models from AudioX',
     packages=find_packages(),  
     install_requires=[
+        'accelerate>=0.25.0',  # For CPU offloading (VRAM optimization)
+        'psutil>=5.9.0',       # For system memory detection
         'aeiou',
         'alias-free-torch==0.0.6',
         'auraloss==0.4.0',
@@ -27,7 +29,7 @@ setup(
         'pandas==2.0.2',
         'pedalboard==0.9.14',
         'prefigure==0.0.9',
-        'pytorch_lightning==2.4.0', 
+        'pytorch_lightning==2.4.0',
         'PyWavelets==1.4.1',
         'safetensors',
         'sentencepiece==0.1.99',

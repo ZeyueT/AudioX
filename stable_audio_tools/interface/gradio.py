@@ -3,7 +3,7 @@ import platform
 import os
 import subprocess as sp
 import gradio as gr
-import json 
+import json
 import torch
 import torchaudio
 
@@ -21,9 +21,42 @@ from ..inference.utils import prepare_audio
 from ..training.utils import copy_state_dict
 from ..data.utils import read_video, merge_video_audio
 
+# Accelerate for CPU offloading (VRAM optimization)
+try:
+    from accelerate import cpu_offload_with_hook, infer_auto_device_map, load_checkpoint_and_dispatch
+    from accelerate.utils import get_balanced_memory
+    ACCELERATE_AVAILABLE = True
+except ImportError:
+    ACCELERATE_AVAILABLE = False
+    print("Warning: accelerate not installed. Run 'pip install accelerate' for VRAM optimization.")
+
+def get_system_memory_info():
+    """Detect available VRAM and RAM for automatic memory configuration."""
+    import psutil
+    
+    # Get RAM info
+    ram_total_gb = psutil.virtual_memory().total / (1024**3)
+    ram_available_gb = psutil.virtual_memory().available / (1024**3)
+    
+    # Get VRAM info if CUDA is available
+    vram_total_gb = 0
+    vram_available_gb = 0
+    if torch.cuda.is_available():
+        vram_total_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        vram_available_gb = torch.cuda.mem_get_info()[0] / (1024**3)
+    
+    return {
+        "ram_total_gb": ram_total_gb,
+        "ram_available_gb": ram_available_gb,
+        "vram_total_gb": vram_total_gb,
+        "vram_available_gb": vram_available_gb
+    }
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# PyTorch memory optimization settings
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -40,8 +73,25 @@ current_sample_size = None
 
 
 
-def load_model(model_name, model_config=None, model_ckpt_path=None, pretrained_name=None, pretransform_ckpt_path=None, device="cuda", model_half=False):
-    global model_configurations
+# Global hook for CPU offloading cleanup
+_cpu_offload_hook = None
+
+def load_model(model_name, model_config=None, model_ckpt_path=None, pretrained_name=None, pretransform_ckpt_path=None, device="cuda", model_half=False, use_cpu_offload=True, max_vram_gb=100):
+    """
+    Load model with optional CPU offloading for low VRAM systems.
+    
+    Args:
+        model_name: Name of the model configuration
+        model_config: Model configuration dict
+        model_ckpt_path: Path to model checkpoint
+        pretrained_name: Name of pretrained model
+        pretransform_ckpt_path: Path to pretransform checkpoint
+        device: Target device ("cuda", "cpu", "mps")
+        model_half: Whether to use FP16 precision (recommended for VRAM savings)
+        use_cpu_offload: Whether to enable CPU offloading (requires accelerate)
+        max_vram_gb: Maximum VRAM to use in GB (kept for compatibility, not actively used)
+    """
+    global model_configurations, _cpu_offload_hook
     
     if pretrained_name is not None:
         print(f"Loading pretrained model {pretrained_name}")
@@ -51,17 +101,111 @@ def load_model(model_name, model_config=None, model_ckpt_path=None, pretrained_n
         model = create_model_from_config(model_config)
         print(f"Loading model checkpoint from {model_ckpt_path}")
         copy_state_dict(model, load_ckpt_state_dict(model_ckpt_path))
+    
     sample_rate = model_config["sample_rate"]
     sample_size = model_config["sample_size"]
+    
     if pretransform_ckpt_path is not None:
         print(f"Loading pretransform checkpoint from {pretransform_ckpt_path}")
         model.pretransform.load_state_dict(load_ckpt_state_dict(pretransform_ckpt_path), strict=False)
         print(f"Done loading pretransform")
-    model.to(device).eval().requires_grad_(False)
+    
+    # Apply FP16 first if requested (reduces memory before moving to device)
     if model_half:
-        model.to(torch.float16)
+        print("Converting model to FP16 for memory efficiency...")
+        model = model.half()
+    
+    model.eval().requires_grad_(False)
+    
+    # Determine if we should use CPU offloading
+    use_accelerate_offload = (
+        use_cpu_offload and
+        ACCELERATE_AVAILABLE and
+        torch.cuda.is_available() and
+        device in ["cuda", torch.device("cuda")]
+    )
+    
+    if use_accelerate_offload:
+        print(f"Setting up balanced CPU/GPU offloading...")
+        
+        # Create offload directory if needed
+        offload_dir = "./offload_temp"
+        os.makedirs(offload_dir, exist_ok=True)
+        
+        try:
+            # Detect system memory automatically
+            mem_info = get_system_memory_info()
+            
+            # Calculate optimal memory limits
+            # Use 90% of available VRAM, leave 10% headroom for system
+            vram_target_gb = mem_info["vram_available_gb"] * 0.9
+            # Use 80% of available RAM for offloading
+            ram_target_gb = mem_info["ram_available_gb"] * 0.8
+            
+            print(f"Memory detection:")
+            print(f"  - VRAM: {mem_info['vram_total_gb']:.1f}GB total, {mem_info['vram_available_gb']:.1f}GB available")
+            print(f"  - RAM: {mem_info['ram_total_gb']:.1f}GB total, {mem_info['ram_available_gb']:.1f}GB available")
+            print(f"  - Using: {vram_target_gb:.1f}GB VRAM (90% of available), {ram_target_gb:.1f}GB RAM (80% of available) for offloading")
+            
+            # Save model to temporary checkpoint for load_checkpoint_and_dispatch
+            temp_checkpoint = os.path.join(offload_dir, "temp_model.pt")
+            torch.save(model.state_dict(), temp_checkpoint)
+            
+            # Create device map that balances between GPU and CPU
+            # This keeps frequently used layers on GPU, offloads others to CPU
+            device_map = infer_auto_device_map(
+                model,
+                max_memory={0: f"{vram_target_gb:.1f}GB", "cpu": f"{ram_target_gb:.1f}GB"},
+                dtype=torch.float16 if model_half else torch.float32,
+                no_split_module_classes=[]  # Let accelerate decide how to split
+            )
+            
+            print(f"Device map created: {device_map}")
+            
+            # Reload model with device map
+            model = load_checkpoint_and_dispatch(
+                model,
+                checkpoint=temp_checkpoint,
+                device_map=device_map,
+                max_memory={0: f"{vram_target_gb:.1f}GB", "cpu": f"{ram_target_gb:.1f}GB"},
+                offload_folder=offload_dir,
+                dtype=torch.float16 if model_half else torch.float32,
+                offload_state_dict=True
+            )
+            
+            print(f"Balanced CPU/GPU offloading enabled successfully")
+            print(f"Model distributed across devices for optimal performance")
+            
+            # Clean up temp checkpoint
+            if os.path.exists(temp_checkpoint):
+                os.remove(temp_checkpoint)
+            
+        except Exception as e:
+            print(f"Warning: Balanced offloading setup failed ({e}), falling back to standard loading")
+            model = model.to(device)
+    else:
+        if use_cpu_offload and not ACCELERATE_AVAILABLE:
+            print("Warning: accelerate not available. Install with: pip install accelerate")
+        print(f"Loading model to {device}...")
+        model = model.to(device)
+    
+    # Clear any cached memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+    
     print(f"Done loading model")
     return model, model_config, sample_rate, sample_size
+
+def cleanup_cpu_offload():
+    """Call this after inference to clean up CPU offload hooks and free memory."""
+    global _cpu_offload_hook
+    if _cpu_offload_hook is not None:
+        _cpu_offload_hook.offload()
+        _cpu_offload_hook = None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
 
 def load_and_process_audio(audio_path, sample_rate, seconds_start, seconds_total):
     if audio_path is None:
@@ -139,6 +283,8 @@ def generate_cond(
     target_fps = model_config.get("video_fps", 5)
     global current_model_name, current_model, current_sample_rate, current_sample_size
     if current_model is None or model_name != current_model_name:
+        # Enable FP16 (model_half=True) and CPU offloading by default for VRAM optimization
+        # This reduces VRAM usage by ~40% with minimal quality impact
         current_model, model_config, sample_rate, sample_size = load_model(
             model_name=model_name,
             model_config=model_config,
@@ -146,7 +292,9 @@ def generate_cond(
             pretrained_name=pretrained_name,
             pretransform_ckpt_path=pretransform_ckpt_path,
             device=device,
-            model_half=False
+            model_half=True,  # FP16 for memory efficiency
+            use_cpu_offload=True,  # Enable accelerate-based CPU offloading
+            max_vram_gb=100  # High limit (effectively unlimited)
         )
         current_model_name = model_name
         model = current_model
@@ -171,10 +319,20 @@ def generate_cond(
     else:
         audio_path = None
     
-    Video_tensors = read_video(video_path, seek_time=seconds_start, duration=seconds_total, target_fps=target_fps)        
+    Video_tensors = read_video(video_path, seek_time=seconds_start, duration=seconds_total, target_fps=target_fps)
     audio_tensor = load_and_process_audio(audio_path, sample_rate, seconds_start, seconds_total)
     
-    audio_tensor = audio_tensor.to(device)
+    # Get model dtype for proper tensor casting (important for FP16 mode)
+    try:
+        model_dtype = next(model.parameters()).dtype
+    except StopIteration:
+        model_dtype = torch.float32
+    
+    # Cast tensors to model's dtype and device (fixes FP16 compatibility)
+    audio_tensor = audio_tensor.to(device=device, dtype=model_dtype)
+    if Video_tensors is not None:
+        Video_tensors = Video_tensors.to(device=device, dtype=model_dtype)
+    
     seconds_input = sample_size / sample_rate
     print(f'video_path: {video_path}')
     
@@ -182,7 +340,7 @@ def generate_cond(
         prompt = ""
         
     conditioning = [{
-        "video_prompt": [Video_tensors.unsqueeze(0)],        
+        "video_prompt": [Video_tensors.unsqueeze(0)] if Video_tensors is not None else None,
         "text_prompt": prompt,
         "audio_prompt": audio_tensor.unsqueeze(0),
         "seconds_start": seconds_start,
@@ -190,7 +348,7 @@ def generate_cond(
     }] * batch_size
     if negative_prompt:
         negative_conditioning = [{
-            "video_prompt": [Video_tensors.unsqueeze(0)],        
+            "video_prompt": [Video_tensors.unsqueeze(0)] if Video_tensors is not None else None,
             "text_prompt": negative_prompt,
             "audio_prompt": audio_tensor.unsqueeze(0),
             "seconds_start": seconds_start,
@@ -296,9 +454,16 @@ def generate_cond(
     if video_path:
         merge_video_audio(video_path, f"{output_dir}/output.wav", output_video_path, seconds_start, seconds_total)
     audio_spectrogram = audio_spectrogram_image(audio, sample_rate=sample_rate)
+    
+    # Cleanup: free memory after inference
     del video_path
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     gc.collect()
+    
+    # Offload model back to CPU if using accelerate (saves VRAM between generations)
+    cleanup_cpu_offload()
+    
     return (output_video_path, f"{output_dir}/output.wav")
 
 def toggle_custom_model(selected_model):

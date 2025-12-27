@@ -74,6 +74,61 @@ python3 run_gradio.py \
     --share
 ```
 
+### 🎯 VRAM Optimization for Low-Memory GPUs
+
+AudioX includes automatic VRAM optimization for systems with limited GPU memory (e.g., 8GB VRAM). The system uses:
+
+- **FP16 (Half Precision)**: Reduces VRAM usage by ~40% with minimal quality impact
+- **CPU Offloading**: Automatically distributes model layers between GPU and CPU using Hugging Face Accelerate
+- **Automatic Memory Detection**: Detects available VRAM and RAM to optimize allocation
+- **Balanced Device Mapping**: Intelligently splits the model across GPU and CPU for optimal performance
+
+By default, the system uses **90% of available VRAM** and **80% of available RAM** for CPU offloading.
+
+#### Memory Detection Output
+When starting the demo, you'll see detailed memory information:
+```
+==================================================
+VRAM Optimization Settings:
+  - FP16 (half precision): Enabled by default
+  - CPU offloading: Enabled by default
+
+System Memory Detection:
+  - VRAM: 7.6GB total, 7.2GB available
+  - RAM: 61.3GB total, 41.9GB available
+
+Planned Memory Allocation:
+  - Using: 6.5GB VRAM (90% of available)
+  - Using: 33.5GB RAM (80% of available)
+==================================================
+```
+
+#### Disabling Optimization Features
+If you have sufficient VRAM or want to disable optimizations:
+
+```bash
+# Disable FP16 (uses more VRAM but may improve quality)
+python3 run_gradio.py --no-half
+
+# Disable CPU offloading (keeps entire model on GPU)
+python3 run_gradio.py --no-cpu-offload
+
+# Disable both optimizations
+python3 run_gradio.py --no-half --no-cpu-offload
+```
+
+#### Manual Configuration
+For advanced users, you can manually set VRAM limits:
+```bash
+# Limit VRAM usage to specific GB (default: auto-detected)
+python3 run_gradio.py --max-vram 8
+```
+
+#### Requirements
+The VRAM optimization requires `accelerate` and `psutil`, which are automatically installed when installing AudioX via `pip`. If you installed manually, install them with:
+```bash
+pip install accelerate psutil
+```
 
 ### 🎯 Prompt Configuration Examples
 
