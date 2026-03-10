@@ -12,7 +12,7 @@
 
 ## 📺 Demo Video
 
-https://github.com/user-attachments/assets/0d8dd927-ff0f-4b35-ab1f-b3c3915017be
+https://github.com/user-attachments/assets/a065b764-3ea4-4e30-aad5-c8cec51c2f0d
 
 ---
 
