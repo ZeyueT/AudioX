@@ -1,0 +1,48 @@
+# AudioX Colab Requirements
+# Optimized for Google Colab environment - uses compatible versions
+
+# Core ML libraries (use Colab's pre-installed versions)
+# torch, torchvision, torchaudio are pre-installed in Colab
+
+# AudioX specific dependencies (Colab-compatible versions)
+aeiou
+alias-free-torch==0.0.6
+auraloss==0.4.0
+descript-audio-codec==1.0.0
+decord==0.6.0
+einops
+einops_exts
+ema-pytorch==0.2.3
+encodec==0.1.1
+huggingface_hub
+k-diffusion==0.1.1
+laion-clap==1.1.6
+local-attention==1.8.6
+pedalboard==0.9.14
+prefigure==0.0.9
+pytorch_lightning==2.4.0
+PyWavelets==1.4.1
+safetensors
+sentencepiece==0.1.99
+torchmetrics==0.11.4
+transformers
+v-diffusion-pytorch==0.0.2
+vector-quantize-pytorch==1.9.14
+webdataset==0.2.48
+x-transformers<1.27.0
+
+# Gradio and interface (compatible versions)
+gradio>=4.40.0,<5.0.0
+gradio_client>=1.0.0,<2.0.0
+
+# Utilities (use Colab's versions where possible)
+tqdm
+wandb
+
+# Note: numpy, pandas, protobuf use Colab's pre-installed versions
+# to avoid conflicts. AudioX will work with these versions.
+
+# System dependencies (installed via apt in Colab)
+# ffmpeg (system package)
+# libsndfile1 (system package)
+# git-lfs (system package)
